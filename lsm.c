@@ -114,4 +114,6 @@ void lsm_close(lsm_db_t *db) {
     free(db);
 }
 
-
+/* TODO
+lsm_put/get/delete
+*/

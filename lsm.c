@@ -114,6 +114,97 @@ void lsm_close(lsm_db_t *db) {
     free(db);
 }
 
-/* TODO
-lsm_put/get/delete
-*/
+int lsm_put(lsm_db_t *db, lsm_slice_t key, lsm_slice_t value) {
+    pthread_mutex_lock(&db->lock);
+
+    if (lsm_wal_append(&db->wal, key, value, 0) != 0)
+        goto err;
+
+    if (lsm_memtable_put(&db->memtable, key, value, 0) != 0)
+        goto err;
+
+    if (db->memtable.size >= LSM_FLUSH_THRESHOLD) {
+        char wal_path[512];
+        snprintf(wal_path, sizeof(wal_path), "%s/wal.log", db->path);
+
+        if (lsm_flush(&db->flush_ctx, &db->memtable, wal_path) != 0)
+            goto err;
+
+        char *last_l0 = db->flush_ctx.l0_files[db->flush_ctx.l0_count - 1];
+        if (lsm_compaction_add_l0(&db->compact_ctx, last_l0) != 0)
+            goto err;
+
+        lsm_memtable_free(&db->memtable);
+        if (lsm_memtable_init(&db->memtable) != 0)
+            goto err;
+
+        lsm_wal_close(&db->wal);
+        if (lsm_wal_open(&db->wal, wal_path) != 0)
+            goto err;
+
+        int lv;
+        while ((lv = lsm_should_compact(&db->compact_ctx)) >= 0) {
+            if (lsm_compact(&db->compact_ctx, lv) != 0)
+                goto err;
+        }
+    }
+    
+    pthread_mutex_unlock(&db->lock);
+    return 0;
+
+err:
+    pthread_mutex_unlock(&db->lock);
+    return -1;
+}
+
+// TODO: lock-free
+int lsm_get(lsm_db_t *db, lsm_slice_t key, lsm_slice_t *value_out) {
+    pthread_mutex_lock(&db->lock);
+
+    uint8_t deleted;
+    int ret = lsm_memtable_get(&db->memtable, key, value_out, &deleted);
+    if (ret == 0) {
+        pthread_mutex_unlock(&db->lock);
+        return deleted ? -1 : 0;
+    }
+
+    for (int lv = 0; lv < LSM_MAX_LEVELS; lv++) {
+        int count = db->compact_ctx.level_counts[lv];
+        for (int i = count - 1; i >= 0; i--) {
+            lsm_sstable_t sst;
+            if (lsm_sstable_open(&sst, db->compact_ctx.level_files[lv][i]) != 0) {
+                pthread_mutex_unlock(&db->lock);
+                return -1;
+            }
+
+            ret = lsm_sstable_get(&sst, key, value_out, &deleted);
+            lsm_sstable_close(&sst);
+            if (ret == 0) {
+                pthread_mutex_unlock(&db->lock);
+                return deleted ? -1 : 0;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&db->lock);
+    return -1;
+}
+
+int lsm_delete(lsm_db_t *db, lsm_slice_t key) {
+    lsm_slice_t empty = {.data = NULL, .len = 0};
+
+    pthread_mutex_lock(&db->lock);
+
+    if (lsm_wal_append(&db->wal, key, empty, 1) != 0) {
+        pthread_mutex_unlock(&db->lock);
+        return -1;
+    }
+
+    if (lsm_memtable_put(&db->memtable, key, empty, 1) != 0) {
+        pthread_mutex_unlock(&db->lock);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&db->lock);
+    return 0;
+}

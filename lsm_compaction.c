@@ -205,6 +205,7 @@ static int slice_cmp(lsm_slice_t a, lsm_slice_t b) {
     return 0;
 }
 
+// TODO: background thread for compaction
 int lsm_compact(lsm_compaction_ctx_t *ctx, int lv) {
     if (lv < 0 || lv >= LSM_MAX_LEVELS - 1)
         return -1;
